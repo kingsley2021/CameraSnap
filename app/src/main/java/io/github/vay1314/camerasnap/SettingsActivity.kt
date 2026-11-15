@@ -42,10 +42,21 @@ import java.util.Date
 import java.util.concurrent.Executors
 
 private data class CameraOption(val id: String, val label: String)
+private data class PhotoCapabilities(
+    val cameras: List<CameraOption>, val formats: List<String>,
+    val sizes: List<PhotoOptions.Resolution>, val format: String, val size: String
+)
 
 class SettingsActivity : ComponentActivity() {
     private var mode by mutableIntStateOf(SnapConfig.OFF)
     private var cameraId by mutableStateOf("")
+    private var photoFormat by mutableStateOf(PhotoOptions.JPEG)
+    private var photoSize by mutableStateOf("")
+    private var photoFormats by mutableStateOf(listOf(PhotoOptions.JPEG))
+    private var photoSizes by mutableStateOf(emptyList<PhotoOptions.Resolution>())
+    private var photoOptionsBusy by mutableStateOf(false)
+    private var photoOptionsError by mutableStateOf<String?>(null)
+    private var capabilityRequest = 0
     private var destination by mutableStateOf(MediaSavePath.DEFAULT)
     private var destinationBusy by mutableStateOf(false)
     private var hidden by mutableStateOf(false)
@@ -150,6 +161,8 @@ class SettingsActivity : ComponentActivity() {
     @Composable
     private fun SettingsScreen() {
         var cameraExpanded by rememberSaveable { mutableStateOf(false) }
+        var formatExpanded by rememberSaveable { mutableStateOf(false) }
+        var sizeExpanded by rememberSaveable { mutableStateOf(false) }
         Scaffold(topBar = { TopAppBar(title = "CameraSnap") }) { padding ->
             LazyColumn(
                 modifier = Modifier.fillMaxSize().imePadding(),
@@ -187,10 +200,66 @@ class SettingsActivity : ComponentActivity() {
                             Column(Modifier.selectableGroup()) {
                                 cameras.forEach { option ->
                                     Choice(option.label, null, option.id == cameraId) {
-                                        SnapConfig.prefs(this@SettingsActivity).edit { putString("camera_id", option.id) }
+                                        SnapConfig.prefs(this@SettingsActivity).edit {
+                                            putString("camera_id", option.id)
+                                            if (option.id != cameraId) putString("photo_size", "")
+                                        }
                                         notifyConfigChanged()
                                         refreshState()
+                                        loadCameras()
                                         cameraExpanded = false
+                                        formatExpanded = false
+                                        sizeExpanded = false
+                                    }
+                                }
+                            }
+                        }
+                        BasicComponent(
+                            title = "照片格式",
+                            summary = if (photoOptionsBusy) "读取摄像头能力中" else photoOptionsError ?:
+                                if (photoFormat == PhotoOptions.HEIC) "HEIC（HEIF）" else
+                                    if (PhotoOptions.HEIC in photoFormats) "JPG" else "JPG · 当前摄像头未提供 HEIC",
+                            onClick = { if (!photoOptionsBusy && photoOptionsError == null) formatExpanded = !formatExpanded },
+                            endActions = { Text(if (formatExpanded) "收起" else "选择", color = MiuixTheme.colorScheme.primary) }
+                        )
+                        if (formatExpanded && !photoOptionsBusy && photoOptionsError == null) {
+                            Column(Modifier.selectableGroup()) {
+                                photoFormats.forEach { format ->
+                                    Choice(if (format == PhotoOptions.HEIC) "HEIC（HEIF）" else "JPG",
+                                        if (format == PhotoOptions.HEIC) "会话不兼容时回退 JPG，实际格式显示在拍摄状态中" else null,
+                                        format == photoFormat) {
+                                        SnapConfig.prefs(this@SettingsActivity).edit {
+                                            putString("photo_format", format)
+                                            if (format != photoFormat) putString("photo_size", "")
+                                        }
+                                        notifyConfigChanged()
+                                        refreshState()
+                                        loadCameras()
+                                        formatExpanded = false
+                                        sizeExpanded = false
+                                    }
+                                }
+                            }
+                        }
+                        val automatic = remember(photoSizes) { runCatching { PhotoOptions.choose(photoSizes, "").label() }.getOrNull() }
+                        BasicComponent(
+                            title = "照片分辨率",
+                            summary = if (photoOptionsBusy) "读取摄像头能力中" else photoOptionsError ?:
+                                photoSizes.firstOrNull { it.key() == photoSize }?.label() ?: "自动 · ${automatic ?: "优先 4:3，约 1250 万像素"}",
+                            onClick = { if (!photoOptionsBusy && photoOptionsError == null) sizeExpanded = !sizeExpanded },
+                            endActions = { Text(if (sizeExpanded) "收起" else "选择", color = MiuixTheme.colorScheme.primary) }
+                        )
+                        if (sizeExpanded && !photoOptionsBusy && photoOptionsError == null) {
+                            Column(Modifier.selectableGroup()) {
+                                Choice("自动", automatic ?: "优先 4:3，约 1250 万像素", photoSize.isEmpty()) {
+                                    savePhotoSize("")
+                                    sizeExpanded = false
+                                }
+                                photoSizes.forEach { size ->
+                                    Choice(size.label(), if (size.pixels() > 20_000_000) "高分辨率可能降低连拍速度" else null,
+                                        photoSize == size.key()) {
+                                        savePhotoSize(size.key())
+                                        sizeExpanded = false
                                     }
                                 }
                             }
@@ -260,6 +329,12 @@ class SettingsActivity : ComponentActivity() {
 
     private fun notifyConfigChanged() = contentResolver.notifyChange(SnapConfig.URI, null)
 
+    private fun savePhotoSize(value: String) {
+        SnapConfig.prefs(this).edit { putString("photo_size", value) }
+        notifyConfigChanged()
+        refreshState()
+    }
+
     private fun chooseDestination() {
         if (destinationBusy) return
         try {
@@ -289,6 +364,8 @@ class SettingsActivity : ComponentActivity() {
         val config = SnapConfig.read(this)
         mode = config.mode
         cameraId = config.cameraId
+        photoFormat = config.photoFormat
+        photoSize = config.photoSize
         destination = config.destinationLabel()
         hidden = packageManager.getComponentEnabledSetting(launcher()) in setOf(
             PackageManager.COMPONENT_ENABLED_STATE_DISABLED, PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER,
@@ -301,9 +378,13 @@ class SettingsActivity : ComponentActivity() {
 
     private fun loadCameras() {
         val appContext = applicationContext
+        val config = SnapConfig.read(this)
+        val request = ++capabilityRequest
+        photoOptionsBusy = true
+        photoOptionsError = null
         settingsIo.execute {
             val options = mutableListOf(CameraOption("", "自动选择后置主摄"))
-            try {
+            val result = runCatching {
                 val manager = appContext.getSystemService(CameraManager::class.java)
                 manager.cameraIdList.forEach { id ->
                     val facing = when (manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING)) {
@@ -313,12 +394,39 @@ class SettingsActivity : ComponentActivity() {
                     }
                     options += CameraOption(id, "$facing · $id")
                 }
-            } catch (e: Exception) {
-                Log.w(HookEntry.TAG, "Cannot enumerate cameras", e)
-                SnapConfig.status(appContext, "读取摄像头失败：${e.message}")
+                val id = PhotoOptions.cameraId(manager, config.cameraId)
+                val map = manager.getCameraCharacteristics(id).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val jpeg = PhotoOptions.supported(map, PhotoOptions.JPEG)
+                val heic = PhotoOptions.supported(map, PhotoOptions.HEIC)
+                check(jpeg.isNotEmpty()) { "当前摄像头没有可用的 JPG 输出" }
+                val formats = if (heic.isEmpty()) listOf(PhotoOptions.JPEG) else listOf(PhotoOptions.JPEG, PhotoOptions.HEIC)
+                val format = if (config.photoFormat in formats) config.photoFormat else PhotoOptions.JPEG
+                val sizes = if (format == PhotoOptions.HEIC) heic else jpeg
+                val size = config.photoSize.takeIf { key -> sizes.any { it.key() == key } } ?: ""
+                PhotoCapabilities(options, formats, sizes, format, size)
             }
             runOnUiThread {
-                if (!isDestroyed && !isFinishing) cameras = options
+                if (!isDestroyed && !isFinishing && request == capabilityRequest) {
+                    photoOptionsBusy = false
+                    result.fold(onSuccess = { loaded ->
+                        cameras = loaded.cameras
+                        photoFormats = loaded.formats
+                        photoSizes = loaded.sizes
+                        if (loaded.format != config.photoFormat || loaded.size != config.photoSize) {
+                            SnapConfig.prefs(this).edit {
+                                putString("photo_format", loaded.format)
+                                putString("photo_size", loaded.size)
+                            }
+                            notifyConfigChanged()
+                            refreshState()
+                        }
+                    }, onFailure = { error ->
+                        cameras = options
+                        photoSizes = emptyList()
+                        photoOptionsError = "读取相机参数失败：${error.message}"
+                        Log.w(HookEntry.TAG, "Cannot enumerate camera photo capabilities", error)
+                    })
+                }
             }
         }
     }

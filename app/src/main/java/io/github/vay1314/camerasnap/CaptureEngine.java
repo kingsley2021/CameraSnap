@@ -67,6 +67,16 @@ final class CaptureEngine {
     private ImageReader reader;
     private ImageReader previewReader;
     private StreamConfigurationMap videoMap;
+    private StreamConfigurationMap photoMap;
+    private String photoFormat;
+    private String photoNote = "";
+    private PhotoOptions.Resolution photoResolution;
+    private final PhotoFallback photoFallback = new PhotoFallback();
+    private boolean photoUseRequestedSize = true, photoUsesManualSize;
+    private final PhotoPipeline photoPipeline = new PhotoPipeline(
+            Math.max(1024 * 1024, Math.min(32L * 1024 * 1024, Runtime.getRuntime().maxMemory() / 8)));
+    private volatile boolean photoSaveFailed;
+    private long lastPhotoRequestAt, readinessStarted;
     private MediaRecorder recorder;
     private ParcelFileDescriptor videoFile;
     private Uri videoUri;
@@ -101,14 +111,7 @@ final class CaptureEngine {
     private void openCamera() {
         try {
             CameraManager manager = context.getSystemService(CameraManager.class);
-            String id = config.cameraId;
-            if (id.isEmpty()) {
-                for (String candidate : manager.getCameraIdList()) {
-                    Integer facing = manager.getCameraCharacteristics(candidate).get(CameraCharacteristics.LENS_FACING);
-                    if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) { id = candidate; break; }
-                }
-            }
-            if (id.isEmpty()) throw new IllegalStateException("没有可用的后置摄像头");
+            String id = PhotoOptions.cameraId(manager, config.cameraId);
             characteristics = manager.getCameraCharacteristics(id);
             orientationListener = new OrientationEventListener(context) {
                 @Override public void onOrientationChanged(int degrees) {
@@ -120,16 +123,19 @@ final class CaptureEngine {
             if (map == null) throw new IllegalStateException("摄像头没有输出配置");
             if (config.mode == SnapConfig.VIDEO) videoMap = map;
             else {
-                Size size = choosePhotoSize(map.getOutputSizes(ImageFormat.JPEG));
-                reader = ImageReader.newInstance(size.getWidth(), size.getHeight(), ImageFormat.JPEG, 2);
-                reader.setOnImageAvailableListener(this::imageAvailable, main);
-                Size preview = choosePreviewSize(map.getOutputSizes(ImageFormat.YUV_420_888));
-                previewReader = ImageReader.newInstance(preview.getWidth(), preview.getHeight(), ImageFormat.YUV_420_888, 2);
-
-                previewReader.setOnImageAvailableListener(source -> {
-                    try (Image frame = source.acquireLatestImage()) {   }
-                    catch (RuntimeException e) { if (!closed) fail(e); }
-                }, main);
+                photoMap = map;
+                String format = config.photoFormat;
+                if (PhotoOptions.HEIC.equals(format) && PhotoOptions.supported(map, format).isEmpty()) {
+                    format = PhotoOptions.JPEG;
+                    photoNote = "当前摄像头未提供 HEIC，已回退 JPG";
+                }
+                try { configurePhotoOutputs(format); }
+                catch (RuntimeException e) {
+                    if (!PhotoOptions.HEIC.equals(format)) throw e;
+                    photoNote = "HEIC 输出不可用，已回退 JPG";
+                    Log.w(HookEntry.TAG, photoNote, e);
+                    configurePhotoOutputs(PhotoOptions.JPEG);
+                }
             }
             main.postDelayed(startupTimeout, 15_000);
             manager.openCamera(id, new CameraDevice.StateCallback() {
@@ -148,6 +154,56 @@ final class CaptureEngine {
                 }
             }, main);
         } catch (Exception e) { fail(e); }
+    }
+
+    private void configurePhotoOutputs(String format) {
+        cleanup(() -> { if (reader != null) reader.close(); });
+        cleanup(() -> { if (previewReader != null) previewReader.close(); });
+        reader = null;
+        previewReader = null;
+        photoFormat = format;
+        java.util.List<PhotoOptions.Resolution> sizes = PhotoOptions.supported(photoMap, format);
+        String requested = photoUseRequestedSize ? config.photoSize : "";
+        photoUsesManualSize = !requested.isEmpty() && sizes.stream().anyMatch(size -> size.key().equals(requested));
+        photoResolution = PhotoOptions.choose(sizes, requested);
+        if (!requested.isEmpty() && !photoUsesManualSize)
+            photoNote = (photoNote.isEmpty() ? "" : photoNote + "；") + "所选分辨率不可用，已使用自动分辨率";
+        reader = ImageReader.newInstance(photoResolution.width, photoResolution.height, PhotoOptions.imageFormat(format), 2);
+        reader.setOnImageAvailableListener(this::imageAvailable, main);
+        Size preview = choosePreviewSize(photoMap.getOutputSizes(ImageFormat.YUV_420_888));
+        double ratio = (double) Math.max(photoResolution.width, photoResolution.height) /
+                Math.min(photoResolution.width, photoResolution.height);
+        Size[] previews = photoMap.getOutputSizes(ImageFormat.YUV_420_888);
+        if (previews != null) preview = Arrays.stream(previews)
+                .filter(size -> size.getWidth() <= 640 && size.getHeight() <= 480 &&
+                        Math.abs((double) Math.max(size.getWidth(), size.getHeight()) /
+                                Math.min(size.getWidth(), size.getHeight()) - ratio) < 0.02)
+                .max(Comparator.comparingLong(size -> (long) size.getWidth() * size.getHeight())).orElse(preview);
+        previewReader = ImageReader.newInstance(preview.getWidth(), preview.getHeight(), ImageFormat.YUV_420_888, 2);
+        previewReader.setOnImageAvailableListener(source -> {
+            if (source != previewReader || closed) return;
+            try (Image frame = source.acquireLatestImage()) { }
+            catch (RuntimeException e) { if (!closed) fail(e); }
+        }, main);
+        Log.i(HookEntry.TAG, "Photo output: " + photoResolution.key() + ", format=" + photoFormat);
+    }
+
+    private boolean fallbackPhotoSession(Exception reason) {
+        if (closed || config.mode != SnapConfig.PHOTO) return false;
+        PhotoFallback.Choice fallback = photoFallback.next(photoFormat, photoUsesManualSize, photoPipeline.hasStarted());
+        if (fallback == null) return false;
+        photoUseRequestedSize = fallback.useSelectedSize;
+        photoNote = (photoNote.isEmpty() ? "" : photoNote + "；") + fallback.message;
+        Log.w(HookEntry.TAG, fallback.message, reason);
+        try {
+            cleanup(() -> { if (session != null) session.close(); });
+            session = null;
+            configurePhotoOutputs(fallback.format);
+            main.removeCallbacks(startupTimeout);
+            main.postDelayed(startupTimeout, 15_000);
+            createSession();
+        } catch (RuntimeException e) { fail(e); }
+        return true;
     }
 
     private void createSession() {
@@ -179,15 +235,18 @@ final class CaptureEngine {
                                 }
                             }, main);
                             main.post(captureNext);
-                        } catch (Exception e) { fail(e); }
+                        } catch (Exception e) { if (!fallbackPhotoSession(e)) fail(e); }
                     }
                 }
                 @Override public void onConfigureFailed(CameraCaptureSession failed) {
                     failed.close();
-                    if (!closed) fail(new IllegalStateException("无法配置拍摄会话"));
+                    if (!closed) {
+                        Exception error = new IllegalStateException("无法配置拍摄会话");
+                        if (!fallbackPhotoSession(error)) fail(error);
+                    }
                 }
             }, main);
-        } catch (Exception e) { fail(e); }
+        } catch (Exception e) { if (!fallbackPhotoSession(e)) fail(e); }
     }
 
     private void autoControls(CaptureRequest.Builder request) {
@@ -212,8 +271,9 @@ final class CaptureEngine {
     }
 
     private void awaitPhoto() {
-        if (closed || waitingForPhoto || photoInFlight) return;
+        if (closed || photoSaveFailed || waitingForPhoto || photoInFlight || !photoPipeline.canCapture()) return;
         waitingForPhoto = true;
+        readinessStarted = SystemClock.uptimeMillis();
         minimumFocusFrame = autofocusMode == CaptureRequest.CONTROL_AF_MODE_AUTO ? Long.MAX_VALUE : 0;
         main.postDelayed(focusTimeout, 3000);
         if (autofocusMode == CaptureRequest.CONTROL_AF_MODE_AUTO) {
@@ -242,11 +302,14 @@ final class CaptureEngine {
     }
 
     private void capturePhoto() {
-        if (closed) return;
+        if (closed || photoSaveFailed) return;
         if (!waitingForPhoto || photoInFlight) return;
         waitingForPhoto = false;
-        photoInFlight = true;
         main.removeCallbacks(focusTimeout);
+        if (!photoPipeline.beginCapture()) return;
+        photoInFlight = true;
+        lastPhotoRequestAt = SystemClock.uptimeMillis();
+        Log.d(HookEntry.TAG, "Photo 3A waitMs=" + (lastPhotoRequestAt - readinessStarted));
         main.postDelayed(photoTimeout, 15_000);
         try {
             CaptureRequest.Builder request = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
@@ -264,43 +327,69 @@ final class CaptureEngine {
     }
 
     private void imageAvailable(ImageReader source) {
-        byte[] jpeg;
+        if (source != reader || closed || !photoInFlight || photoSaveFailed) return;
+        byte[] encoded;
         try (Image image = source.acquireNextImage()) {
             if (image == null) return;
             ByteBuffer buffer = image.getPlanes()[0].getBuffer();
-            jpeg = new byte[buffer.remaining()];
-            buffer.get(jpeg);
+            photoPipeline.imageReceived(buffer.remaining());
+            encoded = new byte[buffer.remaining()];
+            buffer.get(encoded);
         } catch (RuntimeException e) { if (!closed) fail(e); return; }
-        if (closed || !photoInFlight) return;
+        catch (OutOfMemoryError e) { fail(new IllegalStateException("照片内存不足，请降低分辨率", e)); return; }
         photoInFlight = false;
         main.removeCallbacks(photoTimeout);
+        Log.d(HookEntry.TAG, "Photo outputMs=" + (SystemClock.uptimeMillis() - lastPhotoRequestAt) + ", bytes=" + encoded.length);
+        long queuedAt = SystemClock.elapsedRealtime();
         io.execute(() -> {
+            if (photoSaveFailed) {
+                main.post(() -> photoPipeline.saved(encoded.length));
+                return;
+            }
             Uri uri = null;
+            long saveStarted = SystemClock.elapsedRealtime();
             try {
                 uri = insertMedia(false);
                 ParcelFileDescriptor descriptor = context.getContentResolver().openFileDescriptor(uri, "w");
                 if (descriptor == null) throw new IllegalStateException("无法写入照片");
                 try (OutputStream stream = new ParcelFileDescriptor.AutoCloseOutputStream(descriptor)) {
-                    requireSpace(availableBytes(descriptor.getFileDescriptor()), jpeg.length);
-                    stream.write(jpeg);
+                    requireSpace(availableBytes(descriptor.getFileDescriptor()), encoded.length);
+                    stream.write(encoded);
                 }
                 publish(uri);
+                Log.d(HookEntry.TAG, "Photo saveMs=" + (SystemClock.elapsedRealtime() - saveStarted) +
+                        ", queueWaitMs=" + (saveStarted - queuedAt));
                 main.post(() -> {
+                    photoPipeline.saved(encoded.length);
                     photos++;
-                    report("已保存 " + photos + " 张照片到 " + config.destinationLabel());
+                    report("已保存 " + photos + " 张 " + photoFormat.toUpperCase(Locale.ROOT) + " 照片（" +
+                            photoResolution.key() + "）到 " + config.destinationLabel() +
+                            (photoNote.isEmpty() ? "" : "；" + photoNote));
 
                     vibrateShort("photo_saved");
                     if (!closed) {
-                        if (photos >= 100) finished.run();
-                        else main.postDelayed(captureNext, 200);
+                        if (photoPipeline.complete()) finished.run();
+                        else scheduleNextPhoto();
                     }
                 });
             } catch (Exception e) {
+                photoSaveFailed = true;
+                main.post(() -> {
+                    photoPipeline.saved(encoded.length);
+                    if (closed) report("照片保存失败：" + e.getMessage());
+                    else fail(e);
+                });
                 if (uri != null) deleteMedia(uri);
-                SnapConfig.status(context, "照片保存失败：" + e.getMessage());
-                main.post(() -> fail(e));
             }
         });
+        scheduleNextPhoto();
+    }
+
+    private void scheduleNextPhoto() {
+        if (closed || photoSaveFailed || waitingForPhoto || photoInFlight) return;
+        main.removeCallbacks(captureNext);
+        if (photoPipeline.canCapture())
+            main.postDelayed(captureNext, Math.max(0, lastPhotoRequestAt + 200 - SystemClock.uptimeMillis()));
     }
 
     private void prepareVideo(StreamConfigurationMap map) throws Exception {
@@ -388,7 +477,8 @@ final class CaptureEngine {
 
     private Uri insertMedia(boolean video) throws Exception {
         String filename = (video ? "VID_" : "IMG_") +
-                new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ROOT).format(new Date()) + "_SNAP" + (video ? ".mp4" : ".jpg");
+                new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.ROOT).format(new Date()) + "_SNAP" +
+                (video ? ".mp4" : PhotoOptions.extension(photoFormat));
         if (!config.saveTree.isEmpty()) {
             Uri tree = Uri.parse(config.saveTree);
             boolean writable = context.getContentResolver().getPersistedUriPermissions().stream()
@@ -396,13 +486,13 @@ final class CaptureEngine {
             if (!writable) throw new SecurityException("保存目录授权已失效，请在模块设置中重新选择文件夹");
             Uri directory = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
             Uri document = DocumentsContract.createDocument(context.getContentResolver(), directory,
-                    video ? "video/mp4" : "image/jpeg", filename);
+                    video ? "video/mp4" : PhotoOptions.mime(photoFormat), filename);
             if (document == null) throw new IllegalStateException("无法在所选文件夹创建媒体文件");
             return document;
         }
         ContentValues values = new ContentValues();
         values.put(MediaStore.MediaColumns.DISPLAY_NAME, filename);
-        values.put(MediaStore.MediaColumns.MIME_TYPE, video ? "video/mp4" : "image/jpeg");
+        values.put(MediaStore.MediaColumns.MIME_TYPE, video ? "video/mp4" : PhotoOptions.mime(photoFormat));
         values.put(MediaStore.MediaColumns.RELATIVE_PATH, config.savePath);
         values.put(MediaStore.MediaColumns.IS_PENDING, 1);
         Uri uri = context.getContentResolver().insert(video ? MediaStore.Video.Media.EXTERNAL_CONTENT_URI :
@@ -482,6 +572,7 @@ final class CaptureEngine {
     void close(Runnable completed) {
         if (closed) return;
         closed = true;
+        photoPipeline.stop();
         main.removeCallbacks(captureNext);
         main.removeCallbacks(startupTimeout);
         main.removeCallbacks(focusTimeout);
@@ -526,14 +617,6 @@ final class CaptureEngine {
     private void cleanup(Runnable action) {
         try { action.run(); }
         catch (RuntimeException e) { Log.w(HookEntry.TAG, "Resource cleanup failed", e); }
-    }
-
-    static Size choosePhotoSize(Size[] sizes) {
-        if (sizes == null || sizes.length == 0) throw new IllegalStateException("没有 JPEG 输出尺寸");
-        Comparator<Size> area = Comparator.comparingLong(size -> (long) size.getWidth() * size.getHeight());
-        return Arrays.stream(sizes).filter(size -> (long) size.getWidth() * size.getHeight() <= 12_500_000)
-                .max(area).orElseGet(() -> Arrays.stream(sizes).min(area)
-                        .orElseThrow(() -> new IllegalStateException("没有照片尺寸")));
     }
 
     static Size chooseVideoSize(Size[] sizes) {

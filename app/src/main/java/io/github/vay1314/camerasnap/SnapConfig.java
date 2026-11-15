@@ -20,13 +20,22 @@ final class SnapConfig {
     final String savePath;
     final String saveTree;
     final String saveTreeName;
+    final String photoFormat;
+    final String photoSize;
 
     SnapConfig(int mode, String cameraId, String savePath, String saveTree, String saveTreeName) {
+        this(mode, cameraId, savePath, saveTree, saveTreeName, PhotoOptions.JPEG, "");
+    }
+
+    SnapConfig(int mode, String cameraId, String savePath, String saveTree, String saveTreeName,
+            String photoFormat, String photoSize) {
         this.mode = mode == PHOTO || mode == VIDEO ? mode : OFF;
         this.cameraId = cameraId == null ? "" : cameraId;
         this.savePath = MediaSavePath.orDefault(savePath);
         this.saveTree = saveTree == null ? "" : saveTree;
         this.saveTreeName = saveTreeName == null || saveTreeName.isEmpty() ? "所选文件夹" : saveTreeName;
+        this.photoFormat = PhotoOptions.format(photoFormat);
+        this.photoSize = photoSize == null ? "" : photoSize;
     }
 
     String destinationLabel() {
@@ -56,14 +65,16 @@ final class SnapConfig {
         SharedPreferences pref = prefs(context);
         return new SnapConfig(pref.getInt("mode", OFF), pref.getString("camera_id", ""),
                 pref.getString("save_path", MediaSavePath.DEFAULT),
-                pref.getString("save_tree", ""), pref.getString("save_tree_name", ""));
+                pref.getString("save_tree", ""), pref.getString("save_tree_name", ""),
+                pref.getString("photo_format", PhotoOptions.JPEG), pref.getString("photo_size", ""));
     }
 
     static SnapConfig fromBundle(Bundle bundle) {
         return bundle == null ? new SnapConfig(OFF, "", MediaSavePath.DEFAULT, "", "") :
                 new SnapConfig(bundle.getInt("mode", OFF), bundle.getString("camera_id", ""),
                         bundle.getString("save_path", MediaSavePath.DEFAULT),
-                        bundle.getString("save_tree", ""), bundle.getString("save_tree_name", ""));
+                        bundle.getString("save_tree", ""), bundle.getString("save_tree_name", ""),
+                        bundle.getString("photo_format", PhotoOptions.JPEG), bundle.getString("photo_size", ""));
     }
 
     Bundle toBundle() {
@@ -73,6 +84,8 @@ final class SnapConfig {
         bundle.putString("save_path", savePath);
         bundle.putString("save_tree", saveTree);
         bundle.putString("save_tree_name", saveTreeName);
+        bundle.putString("photo_format", photoFormat);
+        bundle.putString("photo_size", photoSize);
         return bundle;
     }
 
