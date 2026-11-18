@@ -28,9 +28,9 @@ final class PhotoPipeline {
     }
 
     void imageReceived(long bytes) {
-        if (!inFlight) throw new IllegalStateException("没有等待中的照片");
+        if (!inFlight) throw new IllegalStateException("No photo request in flight");
         if (bytes <= 0 || bytes > frameLimit || pendingBytes > byteLimit - bytes)
-            throw new IllegalStateException("照片数据过大，请降低分辨率");
+            throw AppText.failure(R.string.photo_too_large);
         inFlight = false;
         pending.addLast(bytes);
         pendingBytes += bytes;

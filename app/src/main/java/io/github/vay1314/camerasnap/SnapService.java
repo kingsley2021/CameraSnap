@@ -12,6 +12,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.content.res.Configuration;
 import android.os.Build;
 import android.os.Binder;
 import android.os.Handler;
@@ -30,9 +31,10 @@ public final class SnapService extends Service {
     private boolean thermalRegistered;
     private boolean receiverRegistered;
     private boolean closing, restartAfterClose;
+    private int activeMode = SnapConfig.OFF;
     private final PowerManager.OnThermalStatusChangedListener thermalListener = status -> {
         if (status >= PowerManager.THERMAL_STATUS_SEVERE && engine != null && !closing)
-            engine.stop("设备温度过高，已停止拍摄");
+            engine.stop(AppText.of(R.string.thermal_stop));
     };
     private final BroadcastReceiver stopReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) { requestStop(); }
@@ -40,15 +42,39 @@ public final class SnapService extends Service {
 
     @Override public void onCreate() {
         super.onCreate();
-        NotificationChannel channel = new NotificationChannel(CHANNEL, "息屏街拍", NotificationManager.IMPORTANCE_LOW);
-        channel.setSound(null, null);
-        channel.enableVibration(false);
-        getSystemService(NotificationManager.class).createNotificationChannel(channel);
+        updateNotificationChannel();
         power = getSystemService(PowerManager.class);
         try {
             power.addThermalStatusListener(getMainExecutor(), thermalListener);
             thermalRegistered = true;
         } catch (RuntimeException e) { Log.w(HookEntry.TAG, "Thermal monitoring unavailable", e); }
+    }
+
+    private void updateNotificationChannel() {
+        Context localized = AppLanguage.wrap(this);
+        NotificationChannel channel = new NotificationChannel(CHANNEL, localized.getString(R.string.notification_channel), NotificationManager.IMPORTANCE_LOW);
+        channel.setSound(null, null);
+        channel.enableVibration(false);
+        getSystemService(NotificationManager.class).createNotificationChannel(channel);
+    }
+
+    private Notification captureNotification(int mode) {
+        Context localized = AppLanguage.wrap(this);
+        Intent stop = new Intent(this, SnapService.class).setAction(SnapConfig.ACTION_STOP);
+        PendingIntent action = PendingIntent.getService(this, 0, stop,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        return new Notification.Builder(this, CHANNEL)
+                .setSmallIcon(android.R.drawable.ic_menu_camera)
+                .setContentTitle(localized.getString(mode == SnapConfig.VIDEO ? R.string.notification_video : R.string.notification_photo))
+                .setContentText(localized.getString(R.string.notification_stop_hint))
+                .setOngoing(true).addAction(new Notification.Action.Builder(null, localized.getString(R.string.stop), action).build()).build();
+    }
+
+    @Override public void onConfigurationChanged(Configuration configuration) {
+        super.onConfigurationChanged(configuration);
+        updateNotificationChannel();
+        if (engine != null)
+            getSystemService(NotificationManager.class).notify(1, captureNotification(activeMode));
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -62,14 +88,7 @@ public final class SnapService extends Service {
         }
         SnapConfig config = SnapConfig.read(this);
         try {
-            Intent stop = new Intent(this, SnapService.class).setAction(SnapConfig.ACTION_STOP);
-            PendingIntent action = PendingIntent.getService(this, 0, stop,
-                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-            Notification notification = new Notification.Builder(this, CHANNEL)
-                    .setSmallIcon(android.R.drawable.ic_menu_camera)
-                    .setContentTitle(config.mode == SnapConfig.VIDEO ? "息屏录像中" : "息屏连拍中")
-                    .setContentText("松开音量下键停止，或点击停止按钮")
-                    .setOngoing(true).addAction(new Notification.Action.Builder(null, "停止", action).build()).build();
+            Notification notification = captureNotification(config.mode);
             if (Build.VERSION.SDK_INT >= 30) {
                 int types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA;
                 if (config.mode == SnapConfig.VIDEO) types |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
@@ -78,7 +97,7 @@ public final class SnapService extends Service {
             if (config.mode == SnapConfig.OFF || power.isInteractive() ||
                     checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED ||
                     (config.mode == SnapConfig.VIDEO && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)) {
-                SnapConfig.status(this, "拍摄未开始：请检查模式、权限和息屏状态");
+                SnapConfig.status(this, R.string.start_check);
                 stopSelf();
                 return START_NOT_STICKY;
             }
@@ -87,7 +106,7 @@ public final class SnapService extends Service {
                 return START_NOT_STICKY;
             }
             if (isThermalConstrained()) {
-                SnapConfig.status(this, "拍摄未开始：设备温度过高，请等待降温");
+                SnapConfig.status(this, R.string.start_hot);
                 stopSelf();
                 return START_NOT_STICKY;
             }
@@ -98,11 +117,12 @@ public final class SnapService extends Service {
             else registerReceiver(stopReceiver, filter);
             receiverRegistered = true;
             main.postDelayed(timeout, SnapConfig.MAX_SESSION_MS);
+            activeMode = config.mode;
             engine = new CaptureEngine(this, config, this::requestStop);
             engine.start();
         } catch (Exception e) {
             Log.e(HookEntry.TAG, "Capture start failed", e);
-            SnapConfig.status(this, "拍摄启动失败：" + e.getClass().getSimpleName() + " · " + e.getMessage());
+            SnapConfig.status(this, R.string.start_failed, AppText.error(e));
             requestStop();
         }
         return START_NOT_STICKY;

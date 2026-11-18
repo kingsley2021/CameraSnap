@@ -20,12 +20,12 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.edit
+import androidx.core.net.toUri
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.role
@@ -33,7 +33,9 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import top.yukonga.miuix.kmp.basic.*
+import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
+import top.yukonga.miuix.kmp.preference.WindowDropdownPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.darkColorScheme
 import top.yukonga.miuix.kmp.theme.lightColorScheme
@@ -52,6 +54,7 @@ class SettingsActivity : ComponentActivity() {
     private var cameraId by mutableStateOf("")
     private var photoFormat by mutableStateOf(PhotoOptions.JPEG)
     private var photoSize by mutableStateOf("")
+    private var photoVibration by mutableIntStateOf(PhotoFeedback.EVERY)
     private var photoFormats by mutableStateOf(listOf(PhotoOptions.JPEG))
     private var photoSizes by mutableStateOf(emptyList<PhotoOptions.Resolution>())
     private var photoOptionsBusy by mutableStateOf(false)
@@ -60,9 +63,10 @@ class SettingsActivity : ComponentActivity() {
     private var destination by mutableStateOf(MediaSavePath.DEFAULT)
     private var destinationBusy by mutableStateOf(false)
     private var hidden by mutableStateOf(false)
+    private var language by mutableStateOf("")
     private var connection by mutableStateOf("")
     private var captureStatus by mutableStateOf("")
-    private var cameras by mutableStateOf(listOf(CameraOption("", "自动选择后置主摄")))
+    private var cameras by mutableStateOf(emptyList<CameraOption>())
     private var pendingMode = SnapConfig.OFF
     private val settingsIo = Executors.newSingleThreadExecutor()
     private val preferenceListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
@@ -83,11 +87,11 @@ class SettingsActivity : ComponentActivity() {
                     val columns = arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME,
                         DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_FLAGS)
                     val name = resolver.query(document, columns, null, null, null)?.use { cursor ->
-                        check(cursor.moveToFirst()) { "所选文件夹不存在" }
+                        check(cursor.moveToFirst()) { getString(R.string.folder_missing) }
                         check(cursor.getString(1) == DocumentsContract.Document.MIME_TYPE_DIR &&
-                            cursor.getInt(2) and DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE != 0) { "所选文件夹不支持写入" }
+                            cursor.getInt(2) and DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE != 0) { getString(R.string.folder_read_only) }
                         cursor.getString(0)
-                    } ?: error("无法读取所选文件夹")
+                    } ?: error(getString(R.string.folder_unreadable))
                     resolver.takePersistableUriPermission(uri,
                         Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
                     SnapConfig.prefs(appContext).edit {
@@ -102,10 +106,10 @@ class SettingsActivity : ComponentActivity() {
                         destinationBusy = false
                         refreshState()
                         result.fold(
-                            onSuccess = { toast("保存文件夹已更新，下次拍摄生效") },
+                            onSuccess = { toast(getString(R.string.folder_updated)) },
                             onFailure = { error ->
                                 Log.w(HookEntry.TAG, "Cannot select save directory", error)
-                                toast("选择文件夹失败：${error.message}")
+                                toast(getString(R.string.folder_failed, AppText.error(error).render(this)))
                             }
                         )
                     }
@@ -118,10 +122,14 @@ class SettingsActivity : ComponentActivity() {
         pendingMode = SnapConfig.OFF
         if (hasPermissions(requested)) saveMode(requested)
         else {
-            SnapConfig.status(this, "需要相机权限；录像还需要麦克风权限，请授权后重新开启。")
+            SnapConfig.status(this, R.string.permission_required)
             refreshState()
         }
         loadCameras()
+    }
+
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppLanguage.wrap(newBase))
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -160,10 +168,7 @@ class SettingsActivity : ComponentActivity() {
 
     @Composable
     private fun SettingsScreen() {
-        var cameraExpanded by rememberSaveable { mutableStateOf(false) }
-        var formatExpanded by rememberSaveable { mutableStateOf(false) }
-        var sizeExpanded by rememberSaveable { mutableStateOf(false) }
-        Scaffold(topBar = { TopAppBar(title = "CameraSnap") }) { padding ->
+        Scaffold(topBar = { TopAppBar(title = getString(R.string.app_name)) }) { padding ->
             LazyColumn(
                 modifier = Modifier.fillMaxSize().imePadding(),
                 contentPadding = PaddingValues(
@@ -175,59 +180,55 @@ class SettingsActivity : ComponentActivity() {
             ) {
                 item {
                     Card(modifier = Modifier.fillMaxWidth()) {
-                        BasicComponent(title = "系统连接", summary = connection)
-                        BasicComponent(title = "最近拍摄", summary = captureStatus)
+                        BasicComponent(title = getString(R.string.how_to_use), summary = getString(R.string.how_to_use_summary))
+                        BasicComponent(title = getString(R.string.first_use), summary = getString(R.string.first_use_summary))
                     }
                 }
                 item {
-                    SmallTitle("拍摄模式")
-                    Card(modifier = Modifier.fillMaxWidth().selectableGroup()) {
-                        Choice("关闭", "保留系统原有按键行为", mode == SnapConfig.OFF) { selectMode(SnapConfig.OFF) }
-                        Choice("息屏连拍", "每成功保存一张照片短振，最多 100 张", mode == SnapConfig.PHOTO) { selectMode(SnapConfig.PHOTO) }
-                        Choice("息屏录像", "录制画面和声音，开始和结束时短振", mode == SnapConfig.VIDEO) { selectMode(SnapConfig.VIDEO) }
-                    }
-                }
-                item {
-                    SmallTitle("拍摄设置")
                     Card(modifier = Modifier.fillMaxWidth()) {
-                        BasicComponent(
-                            title = "摄像头",
-                            summary = cameras.firstOrNull { it.id == cameraId }?.label ?: "当前摄像头不可用 · $cameraId",
-                            onClick = { cameraExpanded = !cameraExpanded },
-                            endActions = { Text(if (cameraExpanded) "收起" else "选择", color = MiuixTheme.colorScheme.primary) }
-                        )
-                        if (cameraExpanded) {
-                            Column(Modifier.selectableGroup()) {
-                                cameras.forEach { option ->
-                                    Choice(option.label, null, option.id == cameraId) {
-                                        SnapConfig.prefs(this@SettingsActivity).edit {
-                                            putString("camera_id", option.id)
-                                            if (option.id != cameraId) putString("photo_size", "")
-                                        }
-                                        notifyConfigChanged()
-                                        refreshState()
-                                        loadCameras()
-                                        cameraExpanded = false
-                                        formatExpanded = false
-                                        sizeExpanded = false
-                                    }
+                        BasicComponent(title = getString(R.string.system_connection), summary = connection)
+                        BasicComponent(title = getString(R.string.recent_capture), summary = captureStatus)
+                    }
+                }
+                item {
+                    SmallTitle(getString(R.string.capture_mode))
+                    Card(modifier = Modifier.fillMaxWidth().selectableGroup()) {
+                        Choice(getString(R.string.mode_off), getString(R.string.mode_off_summary), mode == SnapConfig.OFF) { selectMode(SnapConfig.OFF) }
+                        Choice(getString(R.string.mode_photo), getString(R.string.mode_photo_summary), mode == SnapConfig.PHOTO) { selectMode(SnapConfig.PHOTO) }
+                        Choice(getString(R.string.mode_video), getString(R.string.mode_video_summary), mode == SnapConfig.VIDEO) { selectMode(SnapConfig.VIDEO) }
+                    }
+                }
+                item {
+                    SmallTitle(getString(R.string.capture_settings))
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        WindowDropdownPreference(
+                            title = getString(R.string.camera),
+                            items = cameras.map { it.label },
+                            selectedIndex = cameras.indexOfFirst { it.id == cameraId },
+                            summary = if (cameras.any { it.id == cameraId }) null else
+                                getString(R.string.camera_unavailable, cameraId),
+                            enabled = cameras.isNotEmpty(),
+                            onSelectedIndexChange = { index ->
+                                val option = cameras[index]
+                                SnapConfig.prefs(this@SettingsActivity).edit {
+                                    putString("camera_id", option.id)
+                                    if (option.id != cameraId) putString("photo_size", "")
                                 }
+                                notifyConfigChanged()
+                                refreshState()
+                                loadCameras()
                             }
-                        }
-                        BasicComponent(
-                            title = "照片格式",
-                            summary = if (photoOptionsBusy) "读取摄像头能力中" else photoOptionsError ?:
-                                if (photoFormat == PhotoOptions.HEIC) "HEIC（HEIF）" else
-                                    if (PhotoOptions.HEIC in photoFormats) "JPG" else "JPG · 当前摄像头未提供 HEIC",
-                            onClick = { if (!photoOptionsBusy && photoOptionsError == null) formatExpanded = !formatExpanded },
-                            endActions = { Text(if (formatExpanded) "收起" else "选择", color = MiuixTheme.colorScheme.primary) }
                         )
-                        if (formatExpanded && !photoOptionsBusy && photoOptionsError == null) {
-                            Column(Modifier.selectableGroup()) {
-                                photoFormats.forEach { format ->
-                                    Choice(if (format == PhotoOptions.HEIC) "HEIC（HEIF）" else "JPG",
-                                        if (format == PhotoOptions.HEIC) "会话不兼容时回退 JPG，实际格式显示在拍摄状态中" else null,
-                                        format == photoFormat) {
+                        WindowDropdownPreference(
+                            title = getString(R.string.photo_format),
+                            summary = if (photoOptionsBusy) getString(R.string.loading_camera) else photoOptionsError ?:
+                                if (PhotoOptions.HEIC !in photoFormats) getString(R.string.jpeg_only) else null,
+                            entry = DropdownEntry(photoFormats.map { format ->
+                                DropdownItem(
+                                    text = if (format == PhotoOptions.HEIC) getString(R.string.heic_format) else "JPG",
+                                    summary = if (format == PhotoOptions.HEIC) getString(R.string.heic_hint) else null,
+                                    selected = format == photoFormat,
+                                    onClick = {
                                         SnapConfig.prefs(this@SettingsActivity).edit {
                                             putString("photo_format", format)
                                             if (format != photoFormat) putString("photo_size", "")
@@ -235,59 +236,93 @@ class SettingsActivity : ComponentActivity() {
                                         notifyConfigChanged()
                                         refreshState()
                                         loadCameras()
-                                        formatExpanded = false
-                                        sizeExpanded = false
                                     }
-                                }
-                            }
-                        }
-                        val automatic = remember(photoSizes) { runCatching { PhotoOptions.choose(photoSizes, "").label() }.getOrNull() }
-                        BasicComponent(
-                            title = "照片分辨率",
-                            summary = if (photoOptionsBusy) "读取摄像头能力中" else photoOptionsError ?:
-                                photoSizes.firstOrNull { it.key() == photoSize }?.label() ?: "自动 · ${automatic ?: "优先 4:3，约 1250 万像素"}",
-                            onClick = { if (!photoOptionsBusy && photoOptionsError == null) sizeExpanded = !sizeExpanded },
-                            endActions = { Text(if (sizeExpanded) "收起" else "选择", color = MiuixTheme.colorScheme.primary) }
+                                )
+                            }),
+                            enabled = !photoOptionsBusy && photoOptionsError == null
                         )
-                        if (sizeExpanded && !photoOptionsBusy && photoOptionsError == null) {
-                            Column(Modifier.selectableGroup()) {
-                                Choice("自动", automatic ?: "优先 4:3，约 1250 万像素", photoSize.isEmpty()) {
-                                    savePhotoSize("")
-                                    sizeExpanded = false
-                                }
-                                photoSizes.forEach { size ->
-                                    Choice(size.label(), if (size.pixels() > 20_000_000) "高分辨率可能降低连拍速度" else null,
-                                        photoSize == size.key()) {
-                                        savePhotoSize(size.key())
-                                        sizeExpanded = false
-                                    }
-                                }
-                            }
+                        val locale = resources.configuration.locales[0]
+                        val automatic = remember(photoSizes, locale) {
+                            runCatching { PhotoOptions.choose(photoSizes, "").label(locale) }.getOrNull()
                         }
+                        WindowDropdownPreference(
+                            title = getString(R.string.photo_resolution),
+                            summary = if (photoOptionsBusy) getString(R.string.loading_camera) else photoOptionsError ?:
+                                if (photoSize.isEmpty()) automatic ?: getString(R.string.auto_size_hint) else null,
+                            entry = DropdownEntry(
+                                listOf(DropdownItem(
+                                    text = getString(R.string.automatic),
+                                    summary = automatic ?: getString(R.string.auto_size_hint),
+                                    selected = photoSize.isEmpty(),
+                                    onClick = { savePhotoSize("") }
+                                )) + photoSizes.map { size ->
+                                    DropdownItem(
+                                        text = size.label(locale),
+                                        summary = if (size.pixels() > 20_000_000) getString(R.string.high_resolution_hint) else null,
+                                        selected = photoSize == size.key(),
+                                        onClick = { savePhotoSize(size.key()) }
+                                    )
+                                }
+                            ),
+                            maxHeight = 420.dp,
+                            enabled = !photoOptionsBusy && photoOptionsError == null && photoSizes.isNotEmpty()
+                        )
+                        val vibrationOptions = listOf(
+                            Triple(PhotoFeedback.EVERY, R.string.vibration_every, R.string.vibration_every_hint),
+                            Triple(PhotoFeedback.FIRST, R.string.vibration_first, R.string.vibration_first_hint),
+                            Triple(PhotoFeedback.OFF, R.string.vibration_off, R.string.vibration_off_hint)
+                        )
+                        WindowDropdownPreference(
+                            title = getString(R.string.photo_vibration),
+                            entry = DropdownEntry(vibrationOptions.map { (value, label, hint) ->
+                                DropdownItem(
+                                    text = getString(label), summary = getString(hint),
+                                    selected = photoVibration == value,
+                                    onClick = {
+                                        SnapConfig.prefs(this@SettingsActivity).edit { putInt("photo_vibration", value) }
+                                        notifyConfigChanged()
+                                        refreshState()
+                                    }
+                                )
+                            })
+                        )
                         BasicComponent(
-                            title = "保存路径", summary = destination,
+                            title = getString(R.string.save_folder), summary = destination,
                             onClick = ::chooseDestination,
-                            endActions = { Text(if (destinationBusy) "保存中" else "修改", color = MiuixTheme.colorScheme.primary) }
+                            endActions = { Text(if (destinationBusy) getString(R.string.saving) else getString(R.string.change), color = MiuixTheme.colorScheme.primary) }
                         )
                     }
                 }
                 item {
-                    SmallTitle("应用设置")
+                    SmallTitle(getString(R.string.app_settings))
                     Card(modifier = Modifier.fillMaxWidth()) {
                         SwitchPreference(
-                            title = "隐藏桌面图标", checked = hidden,
-                            summary = "隐藏后从相机设置的“街拍”进入，关闭开关恢复图标",
+                            title = getString(R.string.hide_icon), checked = hidden,
+                            summary = getString(R.string.hide_icon_summary),
                             onCheckedChange = ::setIconHidden
+                        )
+                        val languages = listOf("", "zh-CN", "zh-TW", "en", "de", "ru")
+                        WindowDropdownPreference(
+                            title = getString(R.string.language),
+                            items = listOf(
+                                getString(R.string.language_system),
+                                getString(R.string.language_zh_cn), getString(R.string.language_zh_tw),
+                                getString(R.string.language_en), getString(R.string.language_de),
+                                getString(R.string.language_ru)
+                            ),
+                            selectedIndex = languages.indexOf(language).coerceAtLeast(0),
+                            onSelectedIndexChange = { index -> selectLanguage(languages[index]) }
                         )
                     }
                 }
                 item {
+                    SmallTitle(getString(R.string.other_settings))
                     Card(modifier = Modifier.fillMaxWidth()) {
-                        BasicComponent(title = "使用方法", summary = "熄屏长按音量下键开始，松开停止。亮屏、电源键或音量上键也会停止。单次拍摄最长 1 小时。")
-                        BasicComponent(title = "首次使用", summary = "在 LSPosed 启用模块，勾选相机和系统框架并重启。拍照需要相机权限，录像还需要麦克风权限。")
+                        ArrowPreference(
+                            title = getString(R.string.project_address),
+                            onClick = ::openProject
+                        )
                     }
-                    Text("CameraSnap · ${BuildConfig.VERSION_NAME}",
-                        modifier = Modifier.padding(12.dp), color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
                 }
             }
         }
@@ -324,10 +359,19 @@ class SettingsActivity : ComponentActivity() {
 
     private fun requestStop() {
         try { startService(Intent(this, SnapService::class.java).setAction(SnapConfig.ACTION_STOP)) }
-        catch (e: RuntimeException) { Log.w(HookEntry.TAG, "Cannot stop capture", e); toast("停止拍摄失败") }
+        catch (e: RuntimeException) { Log.w(HookEntry.TAG, "Cannot stop capture", e); toast(getString(R.string.stop_failed)) }
     }
 
     private fun notifyConfigChanged() = contentResolver.notifyChange(SnapConfig.URI, null)
+
+    private fun openProject() {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, "https://github.com/vay1314/CameraSnap".toUri()))
+        } catch (e: RuntimeException) {
+            Log.w(HookEntry.TAG, "Cannot open project homepage", e)
+            toast(getString(R.string.project_open_failed))
+        }
+    }
 
     private fun savePhotoSize(value: String) {
         SnapConfig.prefs(this).edit { putString("photo_size", value) }
@@ -342,38 +386,49 @@ class SettingsActivity : ComponentActivity() {
             directoryPicker.launch(if (tree.isEmpty()) null else Uri.parse(tree))
         } catch (e: RuntimeException) {
             Log.w(HookEntry.TAG, "Cannot open directory picker", e)
-            toast("无法打开系统文件夹选择器")
+            toast(getString(R.string.picker_failed))
         }
     }
 
     private fun launcher() = ComponentName(this, SnapConfig.PACKAGE + ".LauncherActivity")
+
+    private fun selectLanguage(tag: String) {
+        try { AppLanguage.select(this, tag) }
+        catch (e: RuntimeException) {
+            Log.w(HookEntry.TAG, "Cannot change app language", e)
+            toast(getString(R.string.language_change_failed))
+        }
+    }
 
     private fun setIconHidden(value: Boolean) {
         try {
             packageManager.setComponentEnabledSetting(launcher(),
                 if (value) PackageManager.COMPONENT_ENABLED_STATE_DISABLED else PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
                 PackageManager.DONT_KILL_APP)
-            toast(if (value) "桌面图标已隐藏" else "桌面图标已恢复")
-        } catch (e: RuntimeException) { Log.w(HookEntry.TAG, "Cannot change launcher visibility", e); toast("修改桌面图标失败") }
+            toast(if (value) getString(R.string.icon_hidden) else getString(R.string.icon_restored))
+        } catch (e: RuntimeException) { Log.w(HookEntry.TAG, "Cannot change launcher visibility", e); toast(getString(R.string.icon_failed)) }
         refreshState()
     }
 
     private fun toast(value: String) = Toast.makeText(this, value, Toast.LENGTH_SHORT).show()
 
     private fun refreshState() {
+        language = AppLanguage.get(this)
         val config = SnapConfig.read(this)
         mode = config.mode
         cameraId = config.cameraId
         photoFormat = config.photoFormat
         photoSize = config.photoSize
-        destination = config.destinationLabel()
+        photoVibration = config.photoVibration
+        destination = config.destinationText().render(this)
         hidden = packageManager.getComponentEnabledSetting(launcher()) in setOf(
             PackageManager.COMPONENT_ENABLED_STATE_DISABLED, PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER,
             PackageManager.COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED)
         val prefs = SnapConfig.prefs(this)
         val time = prefs.getLong("system_ready_at", 0)
-        connection = if (time == 0L) "等待连接，请启用模块并重启" else "最近连接：${DateFormat.getDateTimeInstance().format(Date(time))}"
-        captureStatus = prefs.getString("status", "尚未拍摄") ?: "尚未拍摄"
+        connection = if (time == 0L) getString(R.string.connection_waiting) else getString(R.string.connection_last,
+            DateFormat.getDateTimeInstance(DateFormat.DEFAULT, DateFormat.DEFAULT, resources.configuration.locales[0]).format(Date(time)))
+        captureStatus = SnapConfig.statusText(this)
     }
 
     private fun loadCameras() {
@@ -383,14 +438,14 @@ class SettingsActivity : ComponentActivity() {
         photoOptionsBusy = true
         photoOptionsError = null
         settingsIo.execute {
-            val options = mutableListOf(CameraOption("", "自动选择后置主摄"))
+            val options = mutableListOf(CameraOption("", getString(R.string.camera_auto)))
             val result = runCatching {
                 val manager = appContext.getSystemService(CameraManager::class.java)
                 manager.cameraIdList.forEach { id ->
                     val facing = when (manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING)) {
-                        CameraCharacteristics.LENS_FACING_BACK -> "后置"
-                        CameraCharacteristics.LENS_FACING_FRONT -> "前置"
-                        else -> "外置"
+                        CameraCharacteristics.LENS_FACING_BACK -> getString(R.string.camera_back)
+                        CameraCharacteristics.LENS_FACING_FRONT -> getString(R.string.camera_front)
+                        else -> getString(R.string.camera_external)
                     }
                     options += CameraOption(id, "$facing · $id")
                 }
@@ -398,7 +453,7 @@ class SettingsActivity : ComponentActivity() {
                 val map = manager.getCameraCharacteristics(id).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
                 val jpeg = PhotoOptions.supported(map, PhotoOptions.JPEG)
                 val heic = PhotoOptions.supported(map, PhotoOptions.HEIC)
-                check(jpeg.isNotEmpty()) { "当前摄像头没有可用的 JPG 输出" }
+                check(jpeg.isNotEmpty()) { getString(R.string.no_jpeg) }
                 val formats = if (heic.isEmpty()) listOf(PhotoOptions.JPEG) else listOf(PhotoOptions.JPEG, PhotoOptions.HEIC)
                 val format = if (config.photoFormat in formats) config.photoFormat else PhotoOptions.JPEG
                 val sizes = if (format == PhotoOptions.HEIC) heic else jpeg
@@ -423,7 +478,7 @@ class SettingsActivity : ComponentActivity() {
                     }, onFailure = { error ->
                         cameras = options
                         photoSizes = emptyList()
-                        photoOptionsError = "读取相机参数失败：${error.message}"
+                        photoOptionsError = getString(R.string.camera_read_failed, AppText.error(error).render(this))
                         Log.w(HookEntry.TAG, "Cannot enumerate camera photo capabilities", error)
                     })
                 }

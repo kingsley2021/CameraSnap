@@ -16,6 +16,7 @@ final class SnapConfig {
     static final long MAX_SESSION_MS = 3_600_000;
 
     final int mode;
+    final int photoVibration;
     final String cameraId;
     final String savePath;
     final String saveTree;
@@ -29,17 +30,23 @@ final class SnapConfig {
 
     SnapConfig(int mode, String cameraId, String savePath, String saveTree, String saveTreeName,
             String photoFormat, String photoSize) {
+        this(mode, cameraId, savePath, saveTree, saveTreeName, photoFormat, photoSize, PhotoFeedback.EVERY);
+    }
+
+    SnapConfig(int mode, String cameraId, String savePath, String saveTree, String saveTreeName,
+            String photoFormat, String photoSize, int photoVibration) {
+        this.photoVibration = PhotoFeedback.normalize(photoVibration);
         this.mode = mode == PHOTO || mode == VIDEO ? mode : OFF;
         this.cameraId = cameraId == null ? "" : cameraId;
         this.savePath = MediaSavePath.orDefault(savePath);
         this.saveTree = saveTree == null ? "" : saveTree;
-        this.saveTreeName = saveTreeName == null || saveTreeName.isEmpty() ? "所选文件夹" : saveTreeName;
+        this.saveTreeName = saveTreeName == null ? "" : saveTreeName;
         this.photoFormat = PhotoOptions.format(photoFormat);
         this.photoSize = photoSize == null ? "" : photoSize;
     }
 
-    String destinationLabel() {
-        if (saveTree.isEmpty()) return savePath;
+    AppText destinationText() {
+        if (saveTree.isEmpty()) return AppText.of(R.string.plain_text, savePath);
         try {
             Uri tree = Uri.parse(saveTree);
             if ("com.android.externalstorage.documents".equals(tree.getAuthority())) {
@@ -48,13 +55,13 @@ final class SnapConfig {
                 if (separator > 0) {
                     String volume = id.substring(0, separator);
                     String path = id.substring(separator + 1);
-                    if ("primary".equals(volume)) return path.isEmpty() ? "内部存储/" : path;
-                    if ("home".equals(volume)) return path.isEmpty() ? "Documents/" : "Documents/" + path;
-                    return "存储卡（" + volume + "）/" + path;
+                    if ("primary".equals(volume)) return path.isEmpty() ? AppText.of(R.string.internal_storage) : AppText.of(R.string.plain_text, path);
+                    if ("home".equals(volume)) return AppText.of(R.string.plain_text, path.isEmpty() ? "Documents/" : "Documents/" + path);
+                    return AppText.of(R.string.storage_card, volume, path);
                 }
             }
         } catch (RuntimeException ignored) { }
-        return "所选文件夹：" + saveTreeName;
+        return saveTreeName.isEmpty() ? AppText.of(R.string.selected_folder) : AppText.of(R.string.selected_folder_name, saveTreeName);
     }
 
     static SharedPreferences prefs(Context context) {
@@ -66,7 +73,7 @@ final class SnapConfig {
         return new SnapConfig(pref.getInt("mode", OFF), pref.getString("camera_id", ""),
                 pref.getString("save_path", MediaSavePath.DEFAULT),
                 pref.getString("save_tree", ""), pref.getString("save_tree_name", ""),
-                pref.getString("photo_format", PhotoOptions.JPEG), pref.getString("photo_size", ""));
+                pref.getString("photo_format", PhotoOptions.JPEG), pref.getString("photo_size", ""), pref.getInt("photo_vibration", PhotoFeedback.EVERY));
     }
 
     static SnapConfig fromBundle(Bundle bundle) {
@@ -74,7 +81,7 @@ final class SnapConfig {
                 new SnapConfig(bundle.getInt("mode", OFF), bundle.getString("camera_id", ""),
                         bundle.getString("save_path", MediaSavePath.DEFAULT),
                         bundle.getString("save_tree", ""), bundle.getString("save_tree_name", ""),
-                        bundle.getString("photo_format", PhotoOptions.JPEG), bundle.getString("photo_size", ""));
+                        bundle.getString("photo_format", PhotoOptions.JPEG), bundle.getString("photo_size", ""), bundle.getInt("photo_vibration", PhotoFeedback.EVERY));
     }
 
     Bundle toBundle() {
@@ -86,10 +93,29 @@ final class SnapConfig {
         bundle.putString("save_tree_name", saveTreeName);
         bundle.putString("photo_format", photoFormat);
         bundle.putString("photo_size", photoSize);
+        bundle.putInt("photo_vibration", photoVibration);
         return bundle;
     }
 
-    static void status(Context context, String text) {
-        prefs(context).edit().putString("status", text).apply();
+    static void status(Context context, int resource, Object... arguments) {
+        status(context, AppText.of(resource, arguments));
+    }
+
+    static void status(Context context, AppText text) {
+        try {
+            prefs(context).edit().putString("status_v2", text.encode(context).toString()).remove("status").apply();
+        } catch (org.json.JSONException e) {
+            android.util.Log.w(HookEntry.TAG, "Cannot encode capture status", e);
+        }
+    }
+
+    static String statusText(Context context) {
+        context = AppLanguage.wrap(context);
+        SharedPreferences pref = prefs(context);
+        String value = pref.getString("status_v2", "");
+        if (value == null || value.isEmpty())
+            return context.getString(pref.contains("status") ? R.string.status_unavailable : R.string.not_captured);
+        try { return AppText.decode(context, new org.json.JSONObject(value)).render(context); }
+        catch (org.json.JSONException | RuntimeException e) { return context.getString(R.string.status_unavailable); }
     }
 }

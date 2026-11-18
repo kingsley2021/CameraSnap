@@ -186,6 +186,11 @@ public final class HookEntry extends XposedModule {
         if (nativeItem == null && Reflection.method(root.getClass(), "findPreference", CharSequence.class).invoke(root, key) != null) return;
         Context context = (Context) Reflection.method(cls, "getContext").invoke(fragment);
         if (context == null) return;
+        Context moduleContext;
+        try { moduleContext = context.createPackageContext(SnapConfig.PACKAGE, 0); }
+        catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            throw new ReflectiveOperationException("Module resources unavailable", e);
+        }
         cameraFragments.add(fragment);
         Class<?> preference = Class.forName("androidx.preference.Preference", false, loader);
         Class<?> listener = Class.forName("androidx.preference.Preference$OnPreferenceClickListener", false, loader);
@@ -198,9 +203,9 @@ public final class HookEntry extends XposedModule {
         PreferenceLink link = new PreferenceLink(item, originalClick, originalSummary);
         if (nativeItem == null) {
             Reflection.method(preference, "setKey", String.class).invoke(item, key);
-            Reflection.method(preference, "setTitle", CharSequence.class).invoke(item, "CameraSnap");
+            Reflection.method(preference, "setTitle", CharSequence.class).invoke(item, moduleContext.getString(R.string.app_name));
         }
-        Reflection.method(preference, "setSummary", CharSequence.class).invoke(item, "模块设置：长按音量下键拍照或录像");
+        Reflection.method(preference, "setSummary", CharSequence.class).invoke(item, moduleContext.getString(R.string.module_settings_summary));
         Object click = Proxy.newProxyInstance(loader, new Class<?>[]{listener}, (proxy, method, args) -> {
             if (method.getName().equals("onPreferenceClick")) {
                 return link.active && !retiring && openSettings(context);

@@ -76,4 +76,11 @@ public class PhotoOptionsTest {
         assertEquals("4096×3072 · 12.58 MP · 4:3", size(4096, 3072).label());
         assertEquals("4096×2304 · 9.44 MP · 16:9", size(4096, 2304).label());
     }
+
+    @Test public void resolutionLabelsFollowLocaleWithoutChangingStoredKeys() {
+        PhotoOptions.Resolution resolution = size(4096, 3072);
+        assertEquals("4096×3072 · 12,58 MP · 4:3", resolution.label(java.util.Locale.GERMAN));
+        assertEquals("4096×3072 · 12.58 MP · 4:3", resolution.label(java.util.Locale.ENGLISH));
+        assertEquals("4096x3072", resolution.key());
+    }
 }

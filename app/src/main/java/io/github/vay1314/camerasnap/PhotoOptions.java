@@ -21,7 +21,7 @@ final class PhotoOptions {
     static final class Resolution {
         final int width, height;
         Resolution(int width, int height) {
-            if (width <= 0 || height <= 0) throw new IllegalArgumentException("无效的照片尺寸");
+            if (width <= 0 || height <= 0) throw new IllegalArgumentException("Invalid photo dimensions");
             this.width = width;
             this.height = height;
         }
@@ -31,10 +31,13 @@ final class PhotoOptions {
             return Math.abs((double) Math.max(width, height) / Math.min(width, height) - 4.0 / 3) < 0.015;
         }
         String label() {
+            return label(Locale.ROOT);
+        }
+        String label(Locale locale) {
             int larger = Math.max(width, height), smaller = Math.min(width, height);
             int a = larger, b = smaller;
             while (b != 0) { int remainder = a % b; a = b; b = remainder; }
-            return String.format(Locale.ROOT, "%d×%d · %.2f MP · %d:%d",
+            return String.format(locale, "%d×%d · %.2f MP · %d:%d",
                     width, height, pixels() / 1_000_000.0, larger / a, smaller / a);
         }
     }
@@ -50,7 +53,7 @@ final class PhotoOptions {
             Integer facing = manager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING);
             if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) return id;
         }
-        throw new IllegalStateException("没有可用的后置摄像头");
+        throw AppText.failure(R.string.no_back_camera);
     }
 
     static List<Resolution> supported(StreamConfigurationMap map, String format) {
@@ -78,7 +81,7 @@ final class PhotoOptions {
     }
 
     static Resolution choose(List<Resolution> sizes, String selected) {
-        if (sizes.isEmpty()) throw new IllegalStateException("摄像头没有支持的照片尺寸");
+        if (sizes.isEmpty()) throw AppText.failure(R.string.no_photo_size);
         for (Resolution size : sizes) if (size.key().equals(selected)) return size;
         Comparator<Resolution> nearTarget = Comparator.comparingLong((Resolution size) -> Math.abs(size.pixels() - TARGET_PIXELS))
                 .thenComparing(Resolution::key);

@@ -12,8 +12,8 @@ android {
         applicationId namespace
         minSdk 29
         targetSdk 37
-        versionCode 2021
-        versionName "2.0.3"
+        versionCode 2022
+        versionName "2.0.4"
         applicationVariants.configureEach { variant ->
             variant.outputs.configureEach {
                 outputFileName = "CameraSnap_" + versionName + "(" + versionCode + ").apk"
@@ -31,6 +31,11 @@ android {
     buildFeatures {
         buildConfig = true
         compose = true
+    }
+    bundle {
+        language {
+            enableSplit = false
+        }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
