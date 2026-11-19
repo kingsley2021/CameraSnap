@@ -9,7 +9,6 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.KeyEvent;
 import java.lang.reflect.Method;
-import java.lang.reflect.Proxy;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -32,7 +31,20 @@ public final class HookEntry extends XposedModule {
     private String processName;
     private final Set<ClassLoader> cameraLoaders = new HashSet<>();
     private final Set<Object> cameraFragments = Collections.newSetFromMap(new WeakHashMap<>());
-    private final Map<Object, WeakReference<PreferenceLink>> preferenceLinks = new WeakHashMap<>();
+    private final Map<Object, PreferenceLink> preferenceLinks = new WeakHashMap<>();
+    private final Map<ClassLoader, PreferenceAccess> cameraPreferences = new java.util.HashMap<>();
+    private Handler cameraMain;
+    private boolean cameraRefreshPending;
+    private final Runnable cameraRefresh = () -> {
+        cameraRefreshPending = false;
+        if (retiring) return;
+        for (Object fragment : cameraFragments.toArray()) {
+            try { addSettingsLink(fragment, fragment.getClass().getClassLoader()); }
+            catch (ReflectiveOperationException | RuntimeException e) {
+                log(Log.ERROR, TAG, "Cannot refresh camera settings entry", e);
+            }
+        }
+    };
     private final ReloadHooks reloadHooks = new ReloadHooks();
 
     @Override public void onModuleLoaded(ModuleLoadedParam param) {
@@ -133,102 +145,137 @@ public final class HookEntry extends XposedModule {
     @SuppressLint("PrivateApi")
     private void installCameraHooks(ClassLoader loader) {
         if (!cameraLoaders.add(loader)) return;
-
+        if (cameraMain == null) cameraMain = new Handler(Looper.getMainLooper());
         try {
-            Class<?> capture = Class.forName("com.android.camera.fragment.settings.CameraCapturePreferenceFragment", false, loader);
-            installHook(Reflection.method(capture, "xh", String.class), chain -> {
-                if (retiring) return chain.proceed();
-                if ("pref_street_shot".equals(chain.getArgs().get(0))) {
+            PreferenceAccess access = new PreferenceAccess(loader);
+            cameraPreferences.put(loader, access);
+            Hooker redirect = chain -> {
+                if (!retiring && access.prepared()) {
                     try {
-                        Context context = (Context) Reflection.method(capture, "getContext").invoke(chain.getThisObject());
-                        if (context != null && openSettings(context)) return true;
+                        Object item = chain.getThisObject();
+                        if (CameraSettingsPolicy.isEntryKey(access.key(item)) && access.usable(item)) {
+                            Context context = access.context(item);
+                            if (context != null && "com.android.camera".equals(context.getPackageName()) && openSettings(context))
+                                return null;
+                        }
                     } catch (ReflectiveOperationException | RuntimeException e) {
-                        log(Log.ERROR, TAG, "Cannot redirect native street settings", e);
+                        log(Log.ERROR, TAG, "Cannot redirect camera preference; retaining original action", e);
                     }
                 }
                 return chain.proceed();
-            });
-            log(Log.INFO, TAG, "Native pref_street_shot redirect installed");
+            };
+            for (Method click : access.clickMethods) installHook(click, redirect);
+            log(Log.INFO, TAG, "Preference click redirect installed by stable entry key");
         } catch (ReflectiveOperationException | RuntimeException e) {
-            log(Log.ERROR, TAG, "Native street settings handler unavailable", e);
+            log(Log.ERROR, TAG, "Camera preference click path unsupported; use the module launcher", e);
+            return;
         }
         try {
-            Class<?> base = Class.forName("com.android.camera.fragment.settings.BasePreferenceFragment", false, loader);
-            Class<?> settings = Class.forName("com.android.camera.fragment.settings.CameraPreferenceFragment", false, loader);
-            for (Method method : new Method[]{Reflection.method(base, "onCreate", Bundle.class),
-                    Reflection.method(base, "ue"), Reflection.method(settings, "onResume")}) {
-                installHook(method, chain -> {
-                    Object result = chain.proceed();
-                    if (retiring) return result;
-                    try { addSettingsLink(chain.getThisObject(), loader); }
+            Class<?> fragment = Class.forName("androidx.fragment.app.Fragment", false, loader);
+            installHook(Reflection.method(fragment, "performResume"), chain -> {
+                Object result = chain.proceed();
+                Object target = chain.getThisObject();
+                if (!retiring) {
+                    try { addSettingsLink(target, loader); }
                     catch (ReflectiveOperationException | RuntimeException e) {
-                        log(Log.ERROR, TAG, "Cannot add camera settings link; launcher settings remain available", e);
+                        log(Log.ERROR, TAG, "Cannot add camera settings entry; launcher remains available", e);
                     }
+                }
+                return result;
+            });
+            log(Log.INFO, TAG, "Camera settings discovery installed on AndroidX fragment resume");
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            log(Log.ERROR, TAG, "Camera settings lifecycle unsupported; click redirect remains available", e);
+        }
+        try {
+            PreferenceAccess access = cameraPreferences.get(loader);
+            if (access != null) for (Method operation : PreferenceAccess.methods(access.group, void.class)) {
+                installHook(operation, chain -> {
+                    Object result = chain.proceed();
+                    scheduleCameraSettingsRefresh();
                     return result;
                 });
             }
-            log(Log.INFO, TAG, "Camera settings hooks installed independently of snap/recording internals");
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            log(Log.ERROR, TAG, "Camera settings structure unsupported; use the module launcher", e);
+        } catch (RuntimeException e) {
+            log(Log.WARN, TAG, "Camera settings rebuild observer unavailable", e);
         }
+    }
+
+    private void scheduleCameraSettingsRefresh() {
+        Handler main = cameraMain;
+        if (retiring || main == null) return;
+        if (Looper.myLooper() != main.getLooper()) {
+            main.post(this::scheduleCameraSettingsRefresh);
+            return;
+        }
+        if (cameraRefreshPending || cameraFragments.isEmpty()) return;
+        cameraRefreshPending = true;
+        if (!main.post(cameraRefresh)) cameraRefreshPending = false;
     }
 
     private void addSettingsLink(Object fragment, ClassLoader loader) throws ReflectiveOperationException {
         if (retiring) return;
-        String name = fragment.getClass().getName();
-        if (!name.endsWith("CameraCommonPreferenceFragment") && !name.endsWith("CameraPreferenceFragment") &&
-                !name.endsWith("CameraPreferenceFragmentMM") && !name.endsWith("CameraCapturePreferenceFragment")) return;
+        PreferenceAccess access = cameraPreferences.get(loader);
+        if (access == null) return;
         Class<?> cls = fragment.getClass();
-        Object root = Reflection.method(cls, "getPreferenceScreen").invoke(fragment);
+        if (!(Boolean) Reflection.method(cls, "isResumed").invoke(fragment)) return;
+        Object root = access.root(fragment);
         if (root == null) return;
-        String key = "unlock_miui_camera_snap_settings";
-        Object nativeItem = Reflection.method(root.getClass(), "findPreference", CharSequence.class).invoke(root, "pref_street_shot");
-        if (nativeItem == null && Reflection.method(root.getClass(), "findPreference", CharSequence.class).invoke(root, key) != null) return;
-        Context context = (Context) Reflection.method(cls, "getContext").invoke(fragment);
-        if (context == null) return;
+        cameraFragments.add(fragment);
+        Context context = access.context(root);
+        if (context == null || !"com.android.camera".equals(context.getPackageName())) return;
+        Object street = access.find(root, CameraSettingsPolicy.STREET_KEY);
+        Object existing = access.find(root, CameraSettingsPolicy.MODULE_KEY);
+        Map<String, Object> categories = new java.util.LinkedHashMap<>();
+        for (String key : CameraSettingsPolicy.CATEGORY_KEYS) {
+            Object category = access.find(root, key);
+            if (category != null && access.group.isInstance(category)) categories.put(key, category);
+        }
+        if (!access.prepared()) {
+            if (street != null) access.prepare(street, CameraSettingsPolicy.STREET_KEY);
+            else if (existing != null) access.prepare(existing, CameraSettingsPolicy.MODULE_KEY);
+            else if (!categories.isEmpty()) {
+                Map.Entry<String, Object> category = categories.entrySet().iterator().next();
+                access.prepare(category.getValue(), category.getKey());
+            } else return;
+        }
+        if (!access.visible(root)) return;
+        java.util.Iterator<Map.Entry<String, Object>> entries = categories.entrySet().iterator();
+        while (entries.hasNext()) if (!access.visible(entries.next().getValue())) entries.remove();
+        CameraSettingsPolicy.Target target = CameraSettingsPolicy.target(street != null && access.usable(street),
+                existing != null, street != null, categories.keySet());
+        if (target == CameraSettingsPolicy.Target.NONE || target == CameraSettingsPolicy.Target.EXISTING) return;
         Context moduleContext;
         try { moduleContext = context.createPackageContext(SnapConfig.PACKAGE, 0); }
         catch (android.content.pm.PackageManager.NameNotFoundException e) {
             throw new ReflectiveOperationException("Module resources unavailable", e);
         }
-        cameraFragments.add(fragment);
-        Class<?> preference = Class.forName("androidx.preference.Preference", false, loader);
-        Class<?> listener = Class.forName("androidx.preference.Preference$OnPreferenceClickListener", false, loader);
-        Object item = nativeItem == null ? preference.getConstructor(Context.class).newInstance(context) : nativeItem;
-        Object originalClick = Reflection.method(preference, "getOnPreferenceClickListener").invoke(item);
-        WeakReference<PreferenceLink> reference = preferenceLinks.get(item);
-        PreferenceLink existing = reference == null ? null : reference.get();
-        if (existing != null && originalClick == existing.installed.get()) return;
-        Object originalSummary = Reflection.method(preference, "getSummary").invoke(item);
-        PreferenceLink link = new PreferenceLink(item, originalClick, originalSummary);
-        if (nativeItem == null) {
-            Reflection.method(preference, "setKey", String.class).invoke(item, key);
-            Reflection.method(preference, "setTitle", CharSequence.class).invoke(item, moduleContext.getString(R.string.app_name));
-        }
-        Reflection.method(preference, "setSummary", CharSequence.class).invoke(item, moduleContext.getString(R.string.module_settings_summary));
-        Object click = Proxy.newProxyInstance(loader, new Class<?>[]{listener}, (proxy, method, args) -> {
-            if (method.getName().equals("onPreferenceClick")) {
-                return link.active && !retiring && openSettings(context);
+        if (target == CameraSettingsPolicy.Target.STREET) {
+            if (existing != null) {
+                PreferenceLink previous = preferenceLinks.remove(existing);
+                if (previous != null) previous.restore();
             }
-            if (method.getName().equals("hashCode")) return System.identityHashCode(proxy);
-            if (method.getName().equals("equals")) return proxy == args[0];
-            return "CameraSnapSettingsListener";
-        });
-        Reflection.method(preference, "setOnPreferenceClickListener", listener).invoke(item, click);
-        link.installed = new WeakReference<>(click);
-        preferenceLinks.put(item, new WeakReference<>(link));
-        if (nativeItem != null) {
-            log(Log.DEBUG, TAG, "Native street preference now opens module settings");
+            String summary = moduleContext.getString(R.string.module_settings_summary);
+            CharSequence current = access.summary(street);
+            PreferenceLink link = preferenceLinks.get(street);
+            if (link == null || !java.util.Objects.equals(current == null ? null : current.toString(), link.installedSummary))
+                link = new PreferenceLink(access, street, current);
+            link.installedSummary = summary;
+            access.summary(street, summary);
+            preferenceLinks.put(street, link);
             return;
         }
-        Object category = null;
-        for (String categoryKey : new String[]{"category_common_setting_group2", "category_photo_setting", "category_module_setting"}) {
-            category = Reflection.method(root.getClass(), "findPreference", CharSequence.class).invoke(root, categoryKey);
-            if (category != null) break;
+        Object item = access.entry(context, moduleContext.getString(R.string.app_name),
+                moduleContext.getString(R.string.module_settings_summary));
+        String category = CameraSettingsPolicy.insertionCategory(categories.keySet());
+        Object parent = category == null ? root : categories.get(category);
+        boolean added = access.add(parent, item);
+        if (added) {
+            PreferenceLink link = new PreferenceLink(access, item, null);
+            link.parent = new WeakReference<>(parent);
+            preferenceLinks.put(item, link);
+            log(Log.DEBUG, TAG, "Added module entry to camera settings category " + category);
         }
-        Object parent = category == null ? root : category;
-        Reflection.method(parent.getClass(), "addPreference", preference).invoke(parent, item);
-        link.parent = new WeakReference<>(parent);
     }
 
     @Override public boolean onHotReloading(HotReloadingParam param) {
@@ -243,10 +290,9 @@ public final class HookEntry extends XposedModule {
             Object[][] fragments = {new Object[0]};
             if ("com.android.camera".equals(processName) && !onMainAndAwait(() -> {
                 fragments[0] = cameraFragments.toArray();
-                for (WeakReference<PreferenceLink> reference : new ArrayList<>(preferenceLinks.values())) {
-                    PreferenceLink link = reference.get();
-                    if (link != null) link.restore();
-                }
+                if (cameraMain != null) cameraMain.removeCallbacks(cameraRefresh);
+                cameraRefreshPending = false;
+                for (PreferenceLink link : new ArrayList<>(preferenceLinks.values())) link.restore();
                 preferenceLinks.clear();
                 cameraFragments.clear();
             })) throw new IllegalStateException("Camera preference cleanup did not finish");
@@ -254,6 +300,7 @@ public final class HookEntry extends XposedModule {
                     cameraLoaders.toArray(new ClassLoader[0]), fragments[0]});
             dispatcher = null;
             cameraLoaders.clear();
+            cameraPreferences.clear();
             log(Log.INFO, TAG, "Old module generation retired for hot reload");
             return true;
         } catch (InterruptedException e) {
@@ -318,34 +365,29 @@ public final class HookEntry extends XposedModule {
     }
 
     private static final class PreferenceLink {
+        final PreferenceAccess access;
         final WeakReference<Object> item;
-        final Object originalClick;
-        final CharSequence originalSummary;
-        WeakReference<Object> installed = new WeakReference<>(null);
+        final String originalSummary;
+        String installedSummary;
         WeakReference<Object> parent = new WeakReference<>(null);
-        boolean active = true;
 
-        PreferenceLink(Object item, Object originalClick, Object originalSummary) {
+        PreferenceLink(PreferenceAccess access, Object item, CharSequence summary) {
+            this.access = access;
             this.item = new WeakReference<>(item);
-            this.originalClick = originalClick;
-            this.originalSummary = originalSummary == null ? null : originalSummary.toString();
+            originalSummary = summary == null ? null : summary.toString();
         }
 
         void restore() {
-            active = false;
             Object preference = item.get();
             if (preference == null) return;
             try {
-                Class<?> cls = preference.getClass();
-                Object current = Reflection.method(cls, "getOnPreferenceClickListener").invoke(preference);
-                if (current != installed.get()) return;
-                Class<?> listener = Class.forName("androidx.preference.Preference$OnPreferenceClickListener", false, cls.getClassLoader());
-                Reflection.method(cls, "setOnPreferenceClickListener", listener).invoke(preference, originalClick);
-                Reflection.method(cls, "setSummary", CharSequence.class).invoke(preference, originalSummary);
                 Object group = parent.get();
                 if (group != null) {
-                    Class<?> base = Class.forName("androidx.preference.Preference", false, cls.getClassLoader());
-                    Reflection.method(group.getClass(), "removePreference", base).invoke(group, preference);
+                    access.remove(group, preference);
+                } else {
+                    CharSequence current = access.summary(preference);
+                    if (java.util.Objects.equals(current == null ? null : current.toString(), installedSummary))
+                        access.summary(preference, originalSummary);
                 }
             } catch (ReflectiveOperationException e) { throw new IllegalStateException(e); }
         }
